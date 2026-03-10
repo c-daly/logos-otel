@@ -141,3 +141,29 @@ All machines point `OTEL_EXPORTER_OTLP_ENDPOINT` at their local collector. Each 
 # Stop and wipe all stored data
 docker compose down -v
 ```
+
+## Auto-Start with Claude Code
+
+To start the stack automatically at the beginning of every Claude Code session, add a `SessionStart` hook to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "OTEL_DIR=\"${LOGOS_OTEL_DIR:-$HOME/.claude/infra/otel}\"; [ -f \"$OTEL_DIR/.env\" ] && docker compose -f \"$OTEL_DIR/docker-compose.yml\" up -d --no-recreate 2>/dev/null; true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook is idempotent (`--no-recreate` skips already-running containers) and fails silently if Docker isn't running or `.env` doesn't exist, so it never blocks Claude from starting.
+
+Set `LOGOS_OTEL_DIR` in your environment to override the default path if you clone the repo elsewhere.
