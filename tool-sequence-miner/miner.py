@@ -9,7 +9,6 @@ import logging
 import os
 import time
 from collections import Counter
-from itertools import islice
 
 import requests
 from prometheus_client import Gauge, start_http_server
