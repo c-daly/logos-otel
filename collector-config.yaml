@@ -70,7 +70,7 @@ service:
       exporters: [prometheus, debug]
     metrics/cloud:
       receivers: [otlp, prometheus/miner, prometheus/exporter]
-      processors: [resource, transform/cloud]
+      processors: [resource, cumulativetodelta, transform/cloud]
       exporters: [otlphttp/grafana_cloud]
     logs:
       receivers: [otlp]
