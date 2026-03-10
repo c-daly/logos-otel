@@ -53,7 +53,7 @@ services:
       - ./tempo-config.yaml:/etc/tempo.yaml:ro
       - tempo-data:/tmp/tempo
     ports:
-      - "3200:3200"
+      - "127.0.0.1:3200:3200"
     restart: unless-stopped
     networks:
       - otel-network
@@ -73,7 +73,7 @@ services:
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     restart: unless-stopped
     depends_on: [prometheus, loki]
     networks:
@@ -87,7 +87,7 @@ services:
       - METRICS_PORT=8099
       - POLL_INTERVAL=300
     ports:
-      - "8099:8099"
+      - "127.0.0.1:8099:8099"
     restart: unless-stopped
     depends_on: [loki]
     networks:
@@ -105,7 +105,7 @@ services:
       - METRICS_PORT=8098
       - POLL_INTERVAL=30
     ports:
-      - "8098:8098"
+      - "127.0.0.1:8098:8098"
     restart: unless-stopped
     depends_on: [otel-collector]
     networks:

@@ -319,7 +319,7 @@ def scrape_dashboard_db() -> None:
         # --- Activity by hour of day and day of week (EST = UTC-5) ---
         ACTIVITY_BY_HOUR._metrics.clear()
         rows = conn.execute(
-            "SELECT CAST(strftime('%H', timestamp, '-5 hours') AS INTEGER) as hour, "
+            "SELECT CAST(strftime('%H', timestamp, 'localtime') AS INTEGER) as hour, "
             "COUNT(*) as cnt FROM events GROUP BY hour ORDER BY hour"
         ).fetchall()
         for r in rows:
@@ -327,7 +327,7 @@ def scrape_dashboard_db() -> None:
 
         ACTIVITY_BY_DAY._metrics.clear()
         rows = conn.execute(
-            "SELECT CAST(strftime('%w', timestamp, '-5 hours') AS INTEGER) as dow, "
+            "SELECT CAST(strftime('%w', timestamp, 'localtime') AS INTEGER) as dow, "
             "COUNT(*) as cnt FROM events GROUP BY dow ORDER BY dow"
         ).fetchall()
         for r in rows:

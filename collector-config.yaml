@@ -65,7 +65,7 @@ exporters:
 service:
   pipelines:
     metrics:
-      receivers: [otlp, prometheus/exporter]
+      receivers: [otlp, prometheus/miner, prometheus/exporter]
       processors: [resource]
       exporters: [prometheus, debug]
     metrics/cloud:

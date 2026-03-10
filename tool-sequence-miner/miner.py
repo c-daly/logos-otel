@@ -58,7 +58,7 @@ def wait_for_loki(max_retries: int = 10) -> None:
             if r.status_code == 200:
                 log.info("Loki is ready")
                 return
-        except requests.ConnectionError:
+        except requests.RequestException:
             pass
         log.info("Waiting for Loki (attempt %d/%d, next in %ds)", attempt + 1, max_retries, delay)
         time.sleep(delay)
