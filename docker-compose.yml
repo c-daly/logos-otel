@@ -1,0 +1,118 @@
+networks:
+  otel-network:
+    driver: bridge
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel/collector-config.yaml"]
+    volumes:
+      - ./collector-config.yaml:/etc/otel/collector-config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:8889:8889"
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - otel-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+    depends_on: [otel-collector]
+    networks:
+      - otel-network
+
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "127.0.0.1:3100:3100"
+    restart: unless-stopped
+    networks:
+      - otel-network
+
+  tempo:
+    image: grafana/tempo:2.3.1
+    container_name: tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo-config.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/tmp/tempo
+    ports:
+      - "127.0.0.1:3200:3200"
+    restart: unless-stopped
+    networks:
+      - otel-network
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    depends_on: [prometheus, loki]
+    networks:
+      - otel-network
+
+  tool-sequence-miner:
+    build: ./tool-sequence-miner
+    container_name: tool-sequence-miner
+    environment:
+      - LOKI_URL=http://loki:3100
+      - METRICS_PORT=8099
+      - POLL_INTERVAL=300
+    ports:
+      - "127.0.0.1:8099:8099"
+    restart: unless-stopped
+    depends_on: [loki]
+    networks:
+      - otel-network
+
+  agent-swarm-exporter:
+    build: ./agent-swarm-exporter
+    container_name: agent-swarm-exporter
+    volumes:
+      - ${AGENT_SWARM_DATA_DIR}:/data:ro
+      - ${AGENT_SWARM_DASHBOARD_DIR}:/dashboard-data:ro
+    environment:
+      - DASHBOARD_DB_PATH=/dashboard-data/dashboard.db
+      - DATASTORE_PATH=/data/datastore.db
+      - METRICS_PORT=8098
+      - POLL_INTERVAL=30
+    ports:
+      - "127.0.0.1:8098:8098"
+    restart: unless-stopped
+    depends_on: [otel-collector]
+    networks:
+      - otel-network
+
+volumes:
+  prometheus-data:
+  loki-data:
+  grafana-data:
+  tempo-data:
