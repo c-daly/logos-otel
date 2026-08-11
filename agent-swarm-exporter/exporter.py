@@ -113,6 +113,7 @@ IMPORT_SOURCE_CALLS = Gauge(
 # Token breakdown
 TOKENS_BY_TOOL = Gauge("agent_swarm_tokens_by_tool", "Token count per tool by type", ["tool", "type"])
 TOKENS_BY_AGENT_ROLE = Gauge("agent_swarm_tokens_by_agent_role", "Token count per agent role by type", ["agent_role", "type"])
+TOKENS_BY_DAY = Gauge("agent_swarm_tokens_by_day", "Transcript token count per day by type", ["day", "type"])
 
 # Subagent / concurrency
 SUBAGENTS_SPAWNED = Gauge("agent_swarm_subagents_spawned_total", "Total distinct subagent IDs ever observed")
@@ -152,9 +153,45 @@ CTRL_SUMMARIZED = Gauge(
     "Summarization count from controller",
     ["was_summarized"],
 )
+CTRL_SUMMARIZED_BY_TOOL = Gauge(
+    "agent_swarm_controller_summarized_by_tool_total",
+    "Controller summarization count by tool/backend",
+    ["tool", "backend", "was_summarized"],
+)
 CTRL_SAVINGS = Gauge(
     "agent_swarm_controller_summarization_savings_bytes",
     "Total bytes saved by summarization",
+)
+CTRL_SAVINGS_BY_TOOL = Gauge(
+    "agent_swarm_controller_summarization_savings_by_tool_bytes",
+    "Bytes saved by summarization per tool/backend",
+    ["tool", "backend"],
+)
+CTRL_RESPONSE_BYTES = Gauge(
+    "agent_swarm_controller_response_bytes_total",
+    "Total response bytes before and after summarization",
+    ["kind"],
+)
+CTRL_RESPONSE_SIZE_AVG = Gauge(
+    "agent_swarm_controller_response_size_avg_bytes",
+    "Average response size per tool/backend before and after summarization",
+    ["tool", "backend", "kind"],
+)
+CTRL_FULL_REQUESTS = Gauge(
+    "agent_swarm_controller_full_content_requests_total",
+    "Number of router__get_full requests recorded by the controller",
+)
+CTRL_SUMMARIES_SINCE_GET_FULL = Gauge(
+    "agent_swarm_controller_summaries_since_get_full_total",
+    "Summarized responses since the first observed router__get_full request",
+)
+CTRL_GET_FULL_RATE = Gauge(
+    "agent_swarm_controller_get_full_rate",
+    "Full-content requests divided by summaries since get_full became available",
+)
+CTRL_EFFECTIVE_SUMMARIZED = Gauge(
+    "agent_swarm_controller_effective_summarized_total",
+    "Summarized responses minus full-content requests",
 )
 CTRL_EVENTS = Gauge(
     "agent_swarm_controller_events_total",
@@ -186,7 +223,19 @@ def _connect(db_path: str):
     if not os.path.exists(db_path):
         yield None
         return
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.execute("PRAGMA schema_version").fetchone()
+    except sqlite3.OperationalError as exc:
+        # WAL databases mounted read-only may lack -wal/-shm sidecar files.
+        # immutable=1 is safe for scrape-only access and avoids creating them.
+        if "unable to open database file" not in str(exc):
+            raise
+        try:
+            conn.close()
+        except UnboundLocalError:
+            pass
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -286,6 +335,21 @@ def scrape_dashboard_db() -> None:
             TOKENS_BY_AGENT_ROLE.labels(agent_role=role, type="output").set(r["outp"] or 0)
             TOKENS_BY_AGENT_ROLE.labels(agent_role=role, type="cache_read").set(r["cr"] or 0)
             TOKENS_BY_AGENT_ROLE.labels(agent_role=role, type="cache_creation").set(r["cc"] or 0)
+
+        # --- Tokens by day ---
+        TOKENS_BY_DAY._metrics.clear()
+        rows = conn.execute(
+            "SELECT substr(timestamp, 1, 10) as day, "
+            "SUM(input_tokens) as inp, SUM(output_tokens) as outp, "
+            "SUM(cache_read_tokens) as cr, SUM(cache_creation_tokens) as cc "
+            "FROM events GROUP BY day ORDER BY day DESC LIMIT 30"
+        ).fetchall()
+        for r in rows:
+            day = r["day"]
+            TOKENS_BY_DAY.labels(day=day, type="input").set(r["inp"] or 0)
+            TOKENS_BY_DAY.labels(day=day, type="output").set(r["outp"] or 0)
+            TOKENS_BY_DAY.labels(day=day, type="cache_read").set(r["cr"] or 0)
+            TOKENS_BY_DAY.labels(day=day, type="cache_creation").set(r["cc"] or 0)
 
         # --- Subagent / concurrency stats ---
         sub_row = conn.execute(
@@ -438,12 +502,85 @@ def scrape_datastore_db() -> None:
             ).fetchone()[0]
             CTRL_SUMMARIZED.labels(was_summarized=label).set(count)
 
+        CTRL_SUMMARIZED_BY_TOOL._metrics.clear()
+        rows = conn.execute(
+            """SELECT tool, backend, was_summarized, COUNT(*) as cnt
+               FROM events
+               GROUP BY tool, backend, was_summarized
+               ORDER BY cnt DESC LIMIT ?""",
+            (TOP_N_TOOLS * 2,),
+        ).fetchall()
+        for r in rows:
+            CTRL_SUMMARIZED_BY_TOOL.labels(
+                tool=r["tool"],
+                backend=r["backend"],
+                was_summarized="true" if r["was_summarized"] else "false",
+            ).set(r["cnt"])
+
         # Total bytes saved
         savings = conn.execute(
-            "SELECT COALESCE(SUM(original_size - COALESCE(summary_size, original_size)), 0) "
+            "SELECT COALESCE(SUM(MAX(original_size - COALESCE(summary_size, original_size), 0)), 0) "
             "FROM events WHERE was_summarized = 1"
         ).fetchone()[0]
         CTRL_SAVINGS.set(savings)
+
+        CTRL_RESPONSE_BYTES._metrics.clear()
+        bytes_row = conn.execute(
+            """SELECT
+                   COALESCE(SUM(original_size), 0) as original_bytes,
+                   COALESCE(SUM(COALESCE(summary_size, original_size)), 0) as emitted_bytes,
+                   COALESCE(SUM(MAX(original_size - COALESCE(summary_size, original_size), 0)), 0) as saved_bytes
+               FROM events"""
+        ).fetchone()
+        CTRL_RESPONSE_BYTES.labels(kind="original").set(bytes_row["original_bytes"])
+        CTRL_RESPONSE_BYTES.labels(kind="emitted").set(bytes_row["emitted_bytes"])
+        CTRL_RESPONSE_BYTES.labels(kind="saved").set(bytes_row["saved_bytes"])
+
+        CTRL_SAVINGS_BY_TOOL._metrics.clear()
+        CTRL_RESPONSE_SIZE_AVG._metrics.clear()
+        rows = conn.execute(
+            """SELECT tool, backend,
+                      COUNT(*) as cnt,
+                      AVG(original_size) as avg_original,
+                      AVG(COALESCE(summary_size, original_size)) as avg_emitted,
+                      COALESCE(SUM(MAX(original_size - COALESCE(summary_size, original_size), 0)), 0) as saved
+               FROM events
+               GROUP BY tool, backend
+               ORDER BY cnt DESC LIMIT ?""",
+            (TOP_N_TOOLS,),
+        ).fetchall()
+        for r in rows:
+            CTRL_SAVINGS_BY_TOOL.labels(tool=r["tool"], backend=r["backend"]).set(r["saved"] or 0)
+            CTRL_RESPONSE_SIZE_AVG.labels(tool=r["tool"], backend=r["backend"], kind="original").set(
+                round(r["avg_original"] or 0, 1)
+            )
+            CTRL_RESPONSE_SIZE_AVG.labels(tool=r["tool"], backend=r["backend"], kind="emitted").set(
+                round(r["avg_emitted"] or 0, 1)
+            )
+
+        full_requests = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE tool LIKE '%get_full%'"
+        ).fetchone()[0]
+        first_get_full = conn.execute(
+            "SELECT MIN(timestamp) FROM events WHERE tool LIKE '%get_full%'"
+        ).fetchone()[0]
+        if first_get_full:
+            summaries_since_get_full = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE was_summarized = 1 AND timestamp >= ?",
+                (first_get_full,),
+            ).fetchone()[0]
+        else:
+            summaries_since_get_full = 0
+
+        summarized_total = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE was_summarized = 1"
+        ).fetchone()[0]
+        CTRL_FULL_REQUESTS.set(full_requests)
+        CTRL_SUMMARIES_SINCE_GET_FULL.set(summaries_since_get_full)
+        CTRL_GET_FULL_RATE.set(
+            full_requests / summaries_since_get_full if summaries_since_get_full else 0
+        )
+        CTRL_EFFECTIVE_SUMMARIZED.set(max(summarized_total - full_requests, 0))
 
         # Workflow events
         CTRL_WORKFLOW_EVENTS._metrics.clear()
