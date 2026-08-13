@@ -243,6 +243,21 @@ def _connect(db_path: str):
         conn.close()
 
 
+def recent_event_count(conn, interval: str) -> int:
+    """Count events newer than ``now + interval`` (e.g. ``interval='-1 hour'``).
+
+    ``datetime(timestamp)`` parses the stored ISO-8601, ``T``-separated timestamps
+    to SQLite's canonical ``YYYY-MM-DD HH:MM:SS`` before comparing. Comparing the
+    raw strings let the ``T`` (0x54) vs space (0x20) at position 10 dominate, so
+    every same-day event matched regardless of time and all windows collapsed to
+    the same count.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM events WHERE datetime(timestamp) > datetime('now', ?)",
+        (interval,),
+    ).fetchone()[0]
+
+
 def scrape_dashboard_db() -> None:
     """Read dashboard.db and update Prometheus gauges."""
     with _connect(DASHBOARD_DB) as conn:
@@ -258,10 +273,7 @@ def scrape_dashboard_db() -> None:
 
         # Events in recent windows
         for window, interval in [("5m", "-5 minutes"), ("1h", "-1 hour"), ("24h", "-24 hours")]:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM events WHERE timestamp > datetime('now', ?)", (interval,)
-            ).fetchone()[0]
-            EVENTS_RECENT.labels(window=window).set(count)
+            EVENTS_RECENT.labels(window=window).set(recent_event_count(conn, interval))
 
         # Per-tool call counts (top N)
         TOOL_CALLS._metrics.clear()
