@@ -1,0 +1,4 @@
+# Test/dev dependencies for the exporter (kept out of the runtime image).
+# Install with: pip install -r requirements-dev.txt  (then: pytest)
+-r requirements.txt
+pytest>=8.0
