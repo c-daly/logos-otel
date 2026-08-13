@@ -12,7 +12,12 @@ if [ ! -f "$SCRIPT_DIR/.env" ]; then
 fi
 
 echo "Starting OTEL stack (collector, prometheus, loki, grafana)..."
-docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d
+# --force-recreate: Docker Desktop on WSL2 can bring containers back (via
+# `restart: unless-stopped`) with STALE bind mounts after a Desktop/host restart
+# -- the mounted dashboards and DBs then appear EMPTY inside the container, so
+# Grafana shows no dashboards and the exporter reports zeros. Recreating the
+# containers re-resolves the mounts against the current host files.
+docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d --force-recreate
 
 echo ""
 echo "Local Grafana:  http://localhost:3000"
