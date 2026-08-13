@@ -1,0 +1,33 @@
+groups:
+  - name: agent-swarm-stack
+    rules:
+      # The collector is the hub: Prometheus scrapes only otel-collector:8889,
+      # and the collector forwards the exporter + miner metrics. If Prometheus
+      # cannot reach it, the whole agent-swarm telemetry pipeline is dark.
+      # This is the guard the 26-day silent outage lacked.
+      - alert: OtelCollectorDown
+        expr: up{job="otel-collector"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OTEL collector is unreachable"
+          description: >-
+            Prometheus has been unable to scrape otel-collector:8889 for 5m;
+            the agent-swarm telemetry pipeline is not producing data.
+
+      # The exporter re-derives metrics from the SQLite DBs and stamps
+      # agent_swarm_exporter_last_scrape_timestamp each cycle (30s). If that
+      # timestamp stops advancing, the exporter is up but its data is frozen
+      # (stuck scrape, missing DB) -- the "serving stale data under fresh
+      # timestamps" failure mode.
+      - alert: AgentSwarmExporterScrapeStale
+        expr: time() - agent_swarm_exporter_last_scrape_timestamp > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "agent-swarm exporter metrics are stale"
+          description: >-
+            agent_swarm_exporter_last_scrape_timestamp is more than 5m old; the
+            exporter is running but not refreshing its DB-derived metrics.
