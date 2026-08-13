@@ -22,7 +22,10 @@ groups:
       # (stuck scrape, missing DB) -- the "serving stale data under fresh
       # timestamps" failure mode.
       - alert: AgentSwarmExporterScrapeStale
-        expr: time() - agent_swarm_exporter_last_scrape_timestamp > 300
+        # `or absent(...)` so the alert also fires when the metric disappears
+        # entirely (exporter down while the collector stays up) -- otherwise
+        # `time() - <absent>` yields an empty vector and the outage is silent.
+        expr: (time() - agent_swarm_exporter_last_scrape_timestamp > 300) or absent(agent_swarm_exporter_last_scrape_timestamp)
         for: 5m
         labels:
           severity: warning
