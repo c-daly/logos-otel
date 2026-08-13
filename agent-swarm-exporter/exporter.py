@@ -27,6 +27,7 @@ import time
 from contextlib import contextmanager
 
 from prometheus_client import Gauge, start_http_server
+from prometheus_client.core import REGISTRY, CounterMetricFamily
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -97,8 +98,6 @@ AGENT_CALLS = Gauge(
     "Tool calls by agent type",
     ["agent_type"],
 )
-EVENTS_TOTAL = Gauge("agent_swarm_events_total", "Total events in dashboard DB")
-SESSIONS_TOTAL = Gauge("agent_swarm_sessions_total", "Total sessions in dashboard DB")
 EVENTS_RECENT = Gauge(
     "agent_swarm_events_recent",
     "Events in recent time window",
@@ -116,7 +115,6 @@ TOKENS_BY_AGENT_ROLE = Gauge("agent_swarm_tokens_by_agent_role", "Token count pe
 TOKENS_BY_DAY = Gauge("agent_swarm_tokens_by_day", "Transcript token count per day by type", ["day", "type"])
 
 # Subagent / concurrency
-SUBAGENTS_SPAWNED = Gauge("agent_swarm_subagents_spawned_total", "Total distinct subagent IDs ever observed")
 SESSIONS_WITH_SUBAGENTS = Gauge("agent_swarm_sessions_with_subagents", "Sessions that had at least one subagent")
 SUBAGENT_TYPE_AGENTS = Gauge("agent_swarm_subagent_type_agents", "Distinct agent count per subagent type", ["agent_type"])
 SUBAGENT_TYPE_EVENTS = Gauge("agent_swarm_subagent_type_events", "Event count per subagent type", ["agent_type"])
@@ -148,16 +146,6 @@ CTRL_DURATION_P95 = Gauge(
     "P95 tool duration from controller (ms)",
     ["tool", "backend"],
 )
-CTRL_SUMMARIZED = Gauge(
-    "agent_swarm_controller_summarized_total",
-    "Summarization count from controller",
-    ["was_summarized"],
-)
-CTRL_SUMMARIZED_BY_TOOL = Gauge(
-    "agent_swarm_controller_summarized_by_tool_total",
-    "Controller summarization count by tool/backend",
-    ["tool", "backend", "was_summarized"],
-)
 CTRL_SAVINGS = Gauge(
     "agent_swarm_controller_summarization_savings_bytes",
     "Total bytes saved by summarization",
@@ -166,11 +154,6 @@ CTRL_SAVINGS_BY_TOOL = Gauge(
     "agent_swarm_controller_summarization_savings_by_tool_bytes",
     "Bytes saved by summarization per tool/backend",
     ["tool", "backend"],
-)
-CTRL_RESPONSE_BYTES = Gauge(
-    "agent_swarm_controller_response_bytes_total",
-    "Total response bytes before and after summarization",
-    ["kind"],
 )
 CTRL_RESPONSE_SIZE_AVG = Gauge(
     "agent_swarm_controller_response_size_avg_bytes",
@@ -258,6 +241,96 @@ def recent_event_count(conn, interval: str) -> int:
     ).fetchone()[0]
 
 
+class CumulativeCountersCollector:
+    """Exposes DB-derived cumulative totals as Prometheus Counters (not Gauges).
+
+    These metrics are monotonic running totals, so exposing them as counters
+    makes Grafana ``rate()`` / ``increase()`` valid (they silently return
+    nonsense on a gauge). Values are recomputed from the read-only DBs on each
+    scrape; ``CounterMetricFamily`` appends the ``_total`` suffix, so the exposed
+    metric names are unchanged (dashboards keep working).
+    """
+
+    def collect(self):
+        yield from self._dashboard_counters()
+        yield from self._datastore_counters()
+
+    def _dashboard_counters(self):
+        with _connect(DASHBOARD_DB) as conn:
+            if conn is None:
+                return
+            events = CounterMetricFamily("agent_swarm_events", "Total events in dashboard DB")
+            events.add_metric([], conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+            yield events
+
+            sessions = CounterMetricFamily("agent_swarm_sessions", "Total sessions in dashboard DB")
+            sessions.add_metric(
+                [], conn.execute("SELECT COUNT(DISTINCT session_id) FROM events").fetchone()[0]
+            )
+            yield sessions
+
+            sub_row = conn.execute(
+                "SELECT COUNT(DISTINCT CASE WHEN agent_id != session_id THEN agent_id END) "
+                "as total_subagents FROM events"
+            ).fetchone()
+            spawned = CounterMetricFamily(
+                "agent_swarm_subagents_spawned", "Total distinct subagent IDs ever observed"
+            )
+            spawned.add_metric([], sub_row["total_subagents"] or 0)
+            yield spawned
+
+    def _datastore_counters(self):
+        with _connect(DATASTORE_DB) as conn:
+            if conn is None:
+                return
+            summarized = CounterMetricFamily(
+                "agent_swarm_controller_summarized",
+                "Summarization count from controller",
+                labels=["was_summarized"],
+            )
+            for val, label in [(1, "true"), (0, "false")]:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE was_summarized = ?", (val,)
+                ).fetchone()[0]
+                summarized.add_metric([label], count)
+            yield summarized
+
+            by_tool = CounterMetricFamily(
+                "agent_swarm_controller_summarized_by_tool",
+                "Controller summarization count by tool/backend",
+                labels=["tool", "backend", "was_summarized"],
+            )
+            rows = conn.execute(
+                "SELECT tool, backend, was_summarized, COUNT(*) as cnt "
+                "FROM events GROUP BY tool, backend, was_summarized "
+                "ORDER BY cnt DESC LIMIT ?",
+                (TOP_N_TOOLS * 2,),
+            ).fetchall()
+            for r in rows:
+                by_tool.add_metric(
+                    [r["tool"], r["backend"], "true" if r["was_summarized"] else "false"],
+                    r["cnt"],
+                )
+            yield by_tool
+
+            resp_bytes = CounterMetricFamily(
+                "agent_swarm_controller_response_bytes",
+                "Total response bytes before and after summarization",
+                labels=["kind"],
+            )
+            bytes_row = conn.execute(
+                """SELECT
+                       COALESCE(SUM(original_size), 0) as original_bytes,
+                       COALESCE(SUM(COALESCE(summary_size, original_size)), 0) as emitted_bytes,
+                       COALESCE(SUM(MAX(original_size - COALESCE(summary_size, original_size), 0)), 0) as saved_bytes
+                   FROM events"""
+            ).fetchone()
+            resp_bytes.add_metric(["original"], bytes_row["original_bytes"])
+            resp_bytes.add_metric(["emitted"], bytes_row["emitted_bytes"])
+            resp_bytes.add_metric(["saved"], bytes_row["saved_bytes"])
+            yield resp_bytes
+
+
 def scrape_dashboard_db() -> None:
     """Read dashboard.db and update Prometheus gauges."""
     with _connect(DASHBOARD_DB) as conn:
@@ -267,9 +340,7 @@ def scrape_dashboard_db() -> None:
 
         # Total events and sessions
         total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-        EVENTS_TOTAL.set(total)
         sessions = conn.execute("SELECT COUNT(DISTINCT session_id) FROM events").fetchone()[0]
-        SESSIONS_TOTAL.set(sessions)
 
         # Events in recent windows
         for window, interval in [("5m", "-5 minutes"), ("1h", "-1 hour"), ("24h", "-24 hours")]:
@@ -369,7 +440,6 @@ def scrape_dashboard_db() -> None:
             "COUNT(DISTINCT CASE WHEN agent_id != session_id THEN session_id END) as sessions_with "
             "FROM events"
         ).fetchone()
-        SUBAGENTS_SPAWNED.set(sub_row["total_subagents"] or 0)
         SESSIONS_WITH_SUBAGENTS.set(sub_row["sessions_with"] or 0)
 
         SUBAGENT_TYPE_AGENTS._metrics.clear()
@@ -506,47 +576,12 @@ def scrape_datastore_db() -> None:
             if p95_row:
                 CTRL_DURATION_P95.labels(tool=r["tool"], backend=r["backend"]).set(p95_row[0])
 
-        # Summarization stats
-        CTRL_SUMMARIZED._metrics.clear()
-        for val, label in [(1, "true"), (0, "false")]:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM events WHERE was_summarized = ?", (val,)
-            ).fetchone()[0]
-            CTRL_SUMMARIZED.labels(was_summarized=label).set(count)
-
-        CTRL_SUMMARIZED_BY_TOOL._metrics.clear()
-        rows = conn.execute(
-            """SELECT tool, backend, was_summarized, COUNT(*) as cnt
-               FROM events
-               GROUP BY tool, backend, was_summarized
-               ORDER BY cnt DESC LIMIT ?""",
-            (TOP_N_TOOLS * 2,),
-        ).fetchall()
-        for r in rows:
-            CTRL_SUMMARIZED_BY_TOOL.labels(
-                tool=r["tool"],
-                backend=r["backend"],
-                was_summarized="true" if r["was_summarized"] else "false",
-            ).set(r["cnt"])
-
         # Total bytes saved
         savings = conn.execute(
             "SELECT COALESCE(SUM(MAX(original_size - COALESCE(summary_size, original_size), 0)), 0) "
             "FROM events WHERE was_summarized = 1"
         ).fetchone()[0]
         CTRL_SAVINGS.set(savings)
-
-        CTRL_RESPONSE_BYTES._metrics.clear()
-        bytes_row = conn.execute(
-            """SELECT
-                   COALESCE(SUM(original_size), 0) as original_bytes,
-                   COALESCE(SUM(COALESCE(summary_size, original_size)), 0) as emitted_bytes,
-                   COALESCE(SUM(MAX(original_size - COALESCE(summary_size, original_size), 0)), 0) as saved_bytes
-               FROM events"""
-        ).fetchone()
-        CTRL_RESPONSE_BYTES.labels(kind="original").set(bytes_row["original_bytes"])
-        CTRL_RESPONSE_BYTES.labels(kind="emitted").set(bytes_row["emitted_bytes"])
-        CTRL_RESPONSE_BYTES.labels(kind="saved").set(bytes_row["saved_bytes"])
 
         CTRL_SAVINGS_BY_TOOL._metrics.clear()
         CTRL_RESPONSE_SIZE_AVG._metrics.clear()
@@ -626,6 +661,7 @@ def main() -> None:
     log.info("  datastore.db: %s", DATASTORE_DB)
     log.info("  poll interval: %ds", POLL_INTERVAL)
 
+    REGISTRY.register(CumulativeCountersCollector())
     start_http_server(METRICS_PORT)
 
     # Initial scrape
